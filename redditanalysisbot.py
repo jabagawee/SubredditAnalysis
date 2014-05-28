@@ -79,46 +79,34 @@ class SubredditAnalysis(object):
         It returns a list of users.
         """
 
-        print "Getting users for /r/%s..." % subreddit
+        users = set()
 
-        # get threads from the hot list
+        print "Getting users for /r/{}...".format(subreddit)
         submissions = self.client.get_subreddit(subreddit).get_hot(limit=self.scrapeLimit)
-
-        # userbase in the selected subreddit to be scanned
-        self.userList = []
-
-        # get the thread creator and if he's not
-        # in the userList then add him there
         for i, submission in enumerate(submissions):
             try:
                 submitter = str(submission.author)
-
             except AttributeError:
                 continue
 
-            # make sure that users don't get added multiple times
-            if submitter not in self.userList:
-                self.userList.append(submitter)
-                print "%d users found up to thread (%d / %d)." % (len(self.userList), i + 1, self.scrapeLimit)
+            if submitter not in users:
+                users.add(submitter)
+                print "{} users found up to thread ({} / {}).".format(len(users), i + 1, self.scrapeLimit)
 
-
-            # load more comments
             submission.replace_more_comments(limit=None, threshold=0)
-
-            # get the comment authors and append
-            # them to userList for scanning
+            # without flatten_tree, we would actually only get top level
+            # comments, which isn't necessarily every commenter
             for comment in praw.helpers.flatten_tree(submission.comments):
                 try:
                     commenter = str(comment.author)
-
                 except AttributeError:
                     continue
 
-                if commenter not in self.userList:
-                    self.userList.append(commenter)
-                    print "%d users found up to thread (%d / %d)." % (len(self.userList), i + 1, self.scrapeLimit)
+                if commenter not in users:
+                    users.add(commenter)
+                    print "{} users found up to thread ({} / {}).".format(len(users), i + 1, self.scrapeLimit)
 
-        return self.userList
+        return users
 
 
     def get_subs(self, userList):
@@ -134,47 +122,36 @@ class SubredditAnalysis(object):
         print "Scanning for overlapping subreddits..."
 
         # list of overlapping subreddits
-        subredditList = []
-
         # keeps count on overlapping users
-        self.counter = Counter()
+        countedSubs = Counter()
 
         # iterate through the list of users in order
         # to get their comments for crossreferencing
         for i, user in enumerate(userList):
+            subredditsForSpecificUser = set()
+
             try:
                 comments = self.client.get_redditor(user).get_comments('all')
-
-            # handle shadowbanned/deleted accounts
             except HTTPError:
+                # these would be shadowbanned/deleted accounts
                 continue
 
-            # keeps track of user subs to prevent multiple
-            # posts from being tallied
-            self.userDone = []
-
-            # keeps track of how many users are remaining
-            usersLeft = len(userList) - i - 1
-
-            print "(%d / %d) users remaining." % (usersLeft, len(userList))
-
             for comment in comments:
-                csubreddit = str(comment.subreddit)
-                if csubreddit not in self.userDone:
-                    # keep tabs on how many
-                    # users post to a subreddit
-                    self.counter[csubreddit] += 1
-                    self.userDone.append(csubreddit)
+                subreddit = str(comment.subreddit)
+                subredditsForSpecificUser.add(subreddit)
 
-                # add the ones that aren't kept in the list
-                # to the list of subreddits
-                if((csubreddit not in subredditList) & (csubreddit not in self.banList)):
-                    subredditList.append(csubreddit)
+            for subreddit in subredditsForSpecificUser - set(self.banList):
+                countedSubs[subreddit] += 1
 
-        return subredditList
+            # keeps tally on which user the crawler
+            # is currently working on
+            usersLeft = len(userList) - i - 1
+            print "({} / {}) users remaining.".format(usersLeft, len(userList))
+
+        return countedSubs
 
 
-    def create_tuples(self, subreddit, subredditList):
+    def create_tuples(self, subreddit, countedSubs, cutoff=1):
         """
         This function takes 2 arguments, the first which
         is the subreddit that is being targeted for the drilldown.
@@ -184,24 +161,13 @@ class SubredditAnalysis(object):
 
         print "Creating tuples..."
 
-        # stores the tuples to be used for printing data
-        self.subredditTuple = []
+        for countedSub in countedSubs.keys():
+            if countedSub.lower() == subreddit.lower():
+                countedSubs.pop(countedSub)
+        tuples = countedSubs.most_common()
+        tuples = [(subreddit, count) for (subreddit, count) in tuples if count >= cutoff]
 
-        # create a bunch of tuples and adds them to a list
-        # to neatly store the collected data for future sorting
-        for item in subredditList:
-            # avoids including posts made
-            # in the selected subreddit
-            # also exclude crossovers with less than 10 posters
-            self.intCounter = int(self.counter[item])
-            if((item.lower() != subreddit.lower()) & (self.intCounter >= 10)):
-                self.subredditTuple.append((item, self.intCounter))
-
-        # sorts biggest to smallest by the 2nd tuple value
-        # which is the post tally
-        self.subredditTuple.sort(key=operator.itemgetter(1), reverse=True)
-
-        return self.subredditTuple
+        return tuples
 
 
     def format_post(self, subreddit, subredditTuple, userList):
@@ -216,23 +182,19 @@ class SubredditAnalysis(object):
 
         print "Formatting post..."
 
-        # make a table
-        self.bodyStart = "## /r/%s Drilldown\n\n" % subreddit
-        self.bodyStart += "Of %d Users Found:\n\n" % len(userList)
-        self.bodyStart += "| Subreddit | Overlapping users |\n"
-        self.bodyStart += "|:------|------:|\n"
+        post = []
+        post.append("## /r/{} Drilldown\n\n".format(subreddit))
+        post.append("Of {} Users Found:\n\n".format(len(userList)))
+        post.append("| Subreddit | Overlapping users |\n")
+        post.append("|:------|------:|\n")
 
-        self.bodyContent = ""
 
         # fill in the table
-        for i in range(0, len(subredditTuple)):
-            sub = "".join(subredditTuple[i][0])
-            overlap = "".join(str(subredditTuple[i][1]))
-            self.bodyContent += "|/r/%s|%s|\n" % (sub, overlap)
+        for sub, overlap in subredditTuple:
+            post.append("|/r/{}|{}|\n".format(sub, overlap))
 
-        text = self.bodyStart + self.bodyContent
-
-        return text
+        post = "".join(post)
+        return post
 
 
     def submit_post(self, subreddit, text):
@@ -269,6 +231,9 @@ class SubredditAnalysis(object):
 
             self.logFile.close()
 
+        else:
+            pass
+
 
     def log_err(self, error):
         """
@@ -285,6 +250,9 @@ class SubredditAnalysis(object):
             self.logFile.write("\n" + str(error))
 
             self.logFile.close()
+
+        else:
+            pass
 
 
 if __name__ == "__main__":
@@ -311,7 +279,15 @@ if __name__ == "__main__":
         # iterate through the drilldownList to get data
         for subreddit in drilldownList:
 
-            if(subreddit in ['quit', '.quit', 'q']):
+            if(subreddit == "quit"):
+                print "Quitting..."
+                exit(0)
+
+            elif(subreddit == ".quit"):
+                print "Quitting..."
+                exit(0)
+
+            elif(subreddit == 'q'):
                 print "Quitting..."
                 exit(0)
 
@@ -319,6 +295,11 @@ if __name__ == "__main__":
                 # get the list of users
                 try:
                     userList = myBot.get_users(subreddit)
+
+                    for user in userList:
+                        myBot.log_info(user + ',')
+
+                    myBot.log_info("\n\n")
 
                 except Exception, e:
                     print e
@@ -336,21 +317,28 @@ if __name__ == "__main__":
                     try:
                         userList = myBot.get_users(subreddit)
 
+                        for user in userList:
+                            myBot.log_info(user + ',')
+
+                        myBot.log_info("\n\n")
+
                     except Exception, e:
                         print e
                         myBot.log_err(e)
                         exit(1)
 
-
-                for user in userList:
-                    myBot.log_info(user + ',')
-
-                myBot.log_info("\n\n")
-
+                except KeyboardInterrupt:
+                    print "\nBot process killed."
+                    exit(0)
 
                 try:
                     # get the list of subreddits
                     subredditList = myBot.get_subs(userList)
+
+                    for sub in subredditList:
+                        myBot.log_info(sub + ',')
+
+                    myBot.log_info("\n\n")
 
                 except Exception, e:
                     print e
@@ -365,15 +353,19 @@ if __name__ == "__main__":
                     try:
                         subredditList = myBot.get_subs(userList)
 
+                        for sub in subredditList:
+                            myBot.log_info(sub + ',')
+
+                        myBot.log_info("\n\n")
+
                     except Exception, e:
                         print e
                         myBot.log_err(e)
                         exit(1)
 
-                for sub in subredditList:
-                    myBot.log_info(sub + ',')
-
-                myBot.log_info("\n\n")
+                except KeyboardInterrupt:
+                    print "\nBot process killed."
+                    exit(0)
 
 
                 try:
@@ -386,14 +378,37 @@ if __name__ == "__main__":
 
                     myBot.log_info("\n\n")
 
-                    # format the data for Reddit
-                    text = myBot.format_post(subreddit, subredditTuple, userList)
-
-                    # submit the post for Reddit
-                    myBot.submit_post(subreddit, text)
                 except Exception, e:
                     print e
                     myBot.log_err(e)
                     exit(1)
 
+                except KeyboardInterrupt:
+                    print "\nBot process killed."
+                    exit(0)
 
+                try:
+                    # format the data for Reddit
+                    text = myBot.format_post(subreddit, subredditTuple, userList)
+
+                except Exception, e:
+                    print e
+                    myBot.log_err(e)
+                    exit(1)
+
+                except KeyboardInterrupt:
+                    print "\nBot process killed."
+                    exit(0)
+
+                try:
+                    # submit the post for Reddit
+                    myBot.submit_post(subreddit, text)
+
+                except Exception, e:
+                    print e
+                    myBot.log_err(e)
+                    exit(1)
+
+                except KeyboardInterrupt:
+                    print "\nBot process killed."
+                    exit(0)
